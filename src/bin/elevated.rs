@@ -26,9 +26,9 @@ fn execute(path: &Path, job: &mut job::Job) -> Result<(), String> {
     update(path, job, "Операция запущена с правами администратора.");
     let data_dir = std::env::var_os("THODHUB_DATA_DIR").map(PathBuf::from).unwrap_or_else(|| path.parent().and_then(Path::parent).unwrap_or(Path::new(".")).to_path_buf());
     if job.operation == "installFolder" {
-        let folder = job.folder.as_deref().ok_or_else(|| "Не выбрана папка с INF-файлами.".to_owned())?;
+        let folder = job.folder.clone().ok_or_else(|| "Не выбрана папка с INF-файлами.".to_owned())?;
         update(path, job, "Установка драйверов из выбранной папки…");
-        let output = drivers::install_inf_folder(folder)?;
+        let output = drivers::install_inf_folder(&folder)?;
         if !output.is_empty() { update(path, job, output); }
         return Ok(());
     }
