@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ThodDriver</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div><h1>Драйверы</h1><p id="summary">Проверьте обновления драйверов через Windows Update.</p></div>
+      <button id="scan" class="primary">Проверить обновления</button>
+    </header>
+    <section class="notice" id="notice" hidden></section>
+    <section class="toolbar">
+      <label><input id="restore" type="checkbox" checked> Создать точку восстановления</label>
+      <label><input id="backup" type="checkbox" checked> Сохранить резервную копию</label>
+      <button id="all" class="quiet">Выбрать все</button>
+      <button id="none" class="quiet">Снять выбор</button>
+    </section>
+    <section id="updates" class="updates" aria-live="polite">
+      <div class="empty">Нажмите «Проверить обновления», чтобы получить список драйверов от Microsoft.</div>
+    </section>
+    <footer>
+      <button id="install-folder" class="quiet">Установить из папки с INF</button>
+      <span id="selected">Не выбрано обновлений</span>
+      <button id="install" class="primary" disabled>Установить выбранное</button>
+    </footer>
+    <details id="log"><summary>Журнал операции</summary><pre></pre></details>
+  </main>
+  <script src="sdk/thodhub.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
