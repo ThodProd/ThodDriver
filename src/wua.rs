@@ -83,7 +83,7 @@ pub fn scan() -> windows::core::Result<Vec<Candidate>> {
 }
 
 /// Скачивает и устанавливает выбранные драйверы. Возвращает true, если нужна перезагрузка.
-pub fn install(ids: &[String], log: &dyn Fn(String)) -> windows::core::Result<bool> {
+pub fn install(ids: &[String], log: &mut dyn FnMut(String)) -> windows::core::Result<bool> {
     let _com = Com::new();
     unsafe {
         let session: IUpdateSession = CoCreateInstance(&UpdateSession, None, CLSCTX_INPROC_SERVER)?;

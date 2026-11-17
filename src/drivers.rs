@@ -1,12 +1,12 @@
 //! Работа с установленными драйверами и системными утилитами Windows.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct InstalledDriver { pub device_name: Option<String>, pub manufacturer: Option<String>, pub driver_version: Option<String>, pub driver_date: Option<String> }
 

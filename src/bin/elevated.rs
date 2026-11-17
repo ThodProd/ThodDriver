@@ -42,8 +42,8 @@ fn execute(path: &Path, job: &mut job::Job) -> Result<(), String> {
     }
     let path_for_log = path.to_path_buf();
     let mut current = job.clone();
-    let log = |message: String| { current.logs.push(message); let _ = write_job(&path_for_log, &current); };
-    let reboot_required = wua::install(&job.driver_ids, &log).map_err(|error| error.to_string())?;
+    let mut log = |message: String| { current.logs.push(message); let _ = write_job(&path_for_log, &current); };
+    let reboot_required = wua::install(&job.driver_ids, &mut log).map_err(|error| error.to_string())?;
     *job = current;
     job.reboot_required = reboot_required;
     Ok(())
@@ -56,7 +56,7 @@ fn main() {
     let bytes = match std::fs::read(&path) { Ok(bytes) => bytes, Err(error) => { eprintln!("Не удалось прочитать задание: {error}"); return; } };
     let mut job: job::Job = match serde_json::from_slice(&bytes) { Ok(job) => job, Err(error) => { eprintln!("Некорректное задание: {error}"); return; } };
     match execute(&path, &mut job) {
-        Ok(()) => { job.state = "completed".to_owned(); update(&path, &mut job, if job.reboot_required { "Готово. Требуется перезагрузка Windows." } else { "Готово." }); }
+        Ok(()) => { job.state = "completed".to_owned(); let message = if job.reboot_required { "Готово. Требуется перезагрузка Windows." } else { "Готово." }; update(&path, &mut job, message); }
         Err(error) => { job.state = "failed".to_owned(); job.error = Some(error.clone()); update(&path, &mut job, format!("Ошибка: {error}")); }
     }
 }
