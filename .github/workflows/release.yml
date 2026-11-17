@@ -17,20 +17,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Собрать worker и помощник
-        run: cargo build --release
+      - name: Подготовить и собрать приложение
+        shell: pwsh
+        run: |
+          & .\tools\generate-icon.ps1 -OutputPath (Join-Path $PWD 'assets\thoddriver.ico')
+          cargo build --release
       - name: Подготовить пакет
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $stage = Join-Path $env:RUNNER_TEMP 'thoddriver-stage'
-          New-Item -ItemType Directory -Force -Path "$stage/ui", "$stage/worker" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage/app" | Out-Null
           Copy-Item hub/manifest.json "$stage/manifest.json"
-          Copy-Item hub/ui/* "$stage/ui" -Recurse
-          Copy-Item target/release/thod-driver.exe "$stage/worker/thod-driver.exe"
-          Copy-Item target/release/elevated.exe "$stage/worker/thod-driver-helper.exe"
+          Copy-Item target/release/ThodDriver.exe "$stage/app/ThodDriver.exe"
           git clone --depth 1 https://github.com/ThodProd/ThodHUB.git "$env:RUNNER_TEMP/ThodHUB"
-          & "$env:RUNNER_TEMP/ThodHUB/scripts/package-module.ps1" -PackageDirectory $stage -Repository ThodProd/ThodDriver -OutputDirectory dist -Notes 'Первый выпуск: поиск обновлений драйверов через Windows Update, резервная копия и установка из папки INF.'
+          & "$env:RUNNER_TEMP/ThodHUB/scripts/package-module.ps1" -PackageDirectory $stage -Repository ThodProd/ThodDriver -OutputDirectory dist -Notes 'Отдельное приложение с корректным запросом прав администратора, иконкой EXE и ярлыка. Поиск и установка драйверов через Windows Update.'
       - name: Опубликовать стабильный выпуск
         env:
           GH_TOKEN: ${{ github.token }}
@@ -40,4 +41,4 @@ jobs:
           $tag = "hub-v$($manifest.version)"
           gh release view $tag 2>$null
           if ($LASTEXITCODE -eq 0) { throw "Выпуск $tag уже существует: старые assets заменять нельзя." }
-          gh release create $tag dist/*.zip dist/thodhub-release.json --title $tag --notes 'Первый выпуск: поиск обновлений драйверов через Windows Update, резервная копия и установка из папки INF.'
+          gh release create $tag dist/*.zip dist/thodhub-release.json --title $tag --notes 'Отдельное приложение с корректным запросом прав администратора, иконкой EXE и ярлыка. Поиск и установка драйверов через Windows Update.'

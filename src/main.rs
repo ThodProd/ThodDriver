@@ -1,74 +1,130 @@
-//! ThodDriver worker: компактный JSON-RPC 2.0 по stdin/stdout для ThodHUB.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod drivers;
-mod job;
 mod wua;
 
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use eframe::egui::{self, Color32, RichText, Vec2};
+use std::path::PathBuf;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
+use std::thread;
 
-const MAX_LINE: usize = 8 * 1024 * 1024;
+const ACCENT: Color32 = Color32::from_rgb(54, 118, 232);
+const MUTED: Color32 = Color32::from_rgb(118, 123, 133);
 
-#[derive(Deserialize)]
-struct Request { jsonrpc: String, id: String, method: String, #[serde(default)] params: Value }
-#[derive(Serialize)]
-struct Response<'a> { jsonrpc: &'a str, id: String, #[serde(skip_serializing_if = "Option::is_none")] result: Option<Value>, #[serde(skip_serializing_if = "Option::is_none")] error: Option<RpcError> }
-#[derive(Serialize)]
-struct RpcError { code: i32, message: String }
+enum Message {
+    Scan { drivers: Vec<wua::Candidate>, installed: usize },
+    Log(String),
+    Finished { reboot: bool },
+    Failed(String),
+}
 
-fn data_dir() -> PathBuf { std::env::var_os("THODHUB_DATA_DIR").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("ThodDriver")) }
-fn job_path(data_dir: &Path, id: &str) -> PathBuf { data_dir.join("runtime").join(format!("{id}.json")) }
-fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
-    let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, serde_json::to_vec(value).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
-    std::fs::rename(temporary, path).map_err(|error| error.to_string())
+#[derive(Clone, Copy, PartialEq)]
+enum State { Idle, Scanning, Ready, Installing, Done }
+
+struct App {
+    state: State,
+    tx: Sender<Message>,
+    rx: Receiver<Message>,
+    candidates: Vec<wua::Candidate>,
+    installed_count: usize,
+    logs: Vec<String>,
+    backup: bool,
+    restore_point: bool,
+    inf_folder: String,
+    reboot: bool,
 }
-fn read_job(path: &Path) -> Result<job::Job, String> { serde_json::from_slice(&std::fs::read(path).map_err(|error| error.to_string())?).map_err(|error| error.to_string()) }
-fn create_id() -> String { format!("job-{}-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|duration| duration.as_millis()).unwrap_or(0), std::process::id()) }
-fn start_elevated(helper: &Path, job: &Path) -> Result<(), String> {
-    let status = Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", "Start-Process -FilePath $args[0] -ArgumentList @('--job', $args[1]) -Verb RunAs", &helper.to_string_lossy(), &job.to_string_lossy()]).status().map_err(|error| error.to_string())?;
-    if status.success() { Ok(()) } else { Err("Не удалось запросить права администратора.".to_owned()) }
-}
-fn start_job(params: &Value, data_dir: &Path) -> Result<Value, String> {
-    let operation = params.get("operation").and_then(Value::as_str).unwrap_or("install");
-    if operation != "install" && operation != "installFolder" { return Err("Неизвестная операция.".to_owned()); }
-    let mut job = job::Job::queued(create_id(), operation);
-    job.driver_ids = params.get("driverIds").and_then(Value::as_array).map(|values| values.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
-    job.folder = params.get("folder").and_then(Value::as_str).map(str::to_owned);
-    job.create_backup = params.get("createBackup").and_then(Value::as_bool).unwrap_or(true);
-    job.create_restore_point = params.get("createRestorePoint").and_then(Value::as_bool).unwrap_or(true);
-    if operation == "install" && job.driver_ids.is_empty() { return Err("Не выбраны драйверы для установки.".to_owned()); }
-    if operation == "installFolder" && job.folder.as_deref().map(str::is_empty).unwrap_or(true) { return Err("Не выбрана папка с INF-файлами.".to_owned()); }
-    let path = job_path(data_dir, &job.id); write_json(&path, &job)?;
-    let helper = std::env::current_exe().map_err(|error| error.to_string())?.parent().ok_or_else(|| "Не найдена папка worker.".to_owned())?.join("thod-driver-helper.exe");
-    if !helper.is_file() { return Err("Не найден помощник установки.".to_owned()); }
-    if let Err(error) = start_elevated(&helper, &path) { job.state = "failed".to_owned(); job.error = Some(error.clone()); job.logs.push(error.clone()); let _ = write_json(&path, &job); return Err(error); }
-    Ok(json!({"jobId": job.id}))
-}
-fn handle(method: &str, params: &Value, data_dir: &Path) -> Result<Value, String> {
-    match method.strip_prefix("worker.").unwrap_or(method) {
-        "scan" => Ok(serde_json::to_value(wua::scan().map_err(|error| error.to_string())?).map_err(|error| error.to_string())?),
-        "installed" => Ok(serde_json::to_value(drivers::installed()?).map_err(|error| error.to_string())?),
-        "job.start" => start_job(params, data_dir),
-        "job.status" => { let id = params.get("jobId").and_then(Value::as_str).ok_or_else(|| "Не указан jobId.".to_owned())?; Ok(serde_json::to_value(read_job(&job_path(data_dir, id))?).map_err(|error| error.to_string())?) }
-        _ => Err("Неизвестный метод worker.".to_owned()),
+
+impl App {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut visuals = egui::Visuals::light();
+        visuals.panel_fill = Color32::WHITE;
+        visuals.window_fill = Color32::WHITE;
+        visuals.selection.bg_fill = ACCENT;
+        cc.egui_ctx.set_visuals(visuals);
+        let (tx, rx) = channel();
+        Self { state: State::Idle, tx, rx, candidates: Vec::new(), installed_count: 0, logs: Vec::new(), backup: true, restore_point: true, inf_folder: String::new(), reboot: false }
+    }
+
+    fn data_dir() -> PathBuf {
+        std::env::var_os("THODHUB_DATA_DIR").map(PathBuf::from).unwrap_or_else(|| {
+            std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("ThodHUB").join("Data").join("thoddriver")
+        })
+    }
+
+    fn scan(&mut self) {
+        self.state = State::Scanning; self.candidates.clear(); self.logs.push("Поиск обновлений через Windows Update…".to_owned());
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let installed = drivers::installed().map(|list| list.len()).unwrap_or(0);
+            match wua::scan() { Ok(drivers) => { let _ = tx.send(Message::Scan { drivers, installed }); }, Err(error) => { let _ = tx.send(Message::Failed(format!("Windows Update: {error}"))); } }
+        });
+    }
+
+    fn install(&mut self) {
+        let ids: Vec<String> = self.candidates.iter().filter(|driver| driver.selected).map(|driver| driver.id.clone()).collect();
+        if ids.is_empty() { return; }
+        self.state = State::Installing; self.logs.push("Установка запущена с правами администратора.".to_owned());
+        let tx = self.tx.clone(); let backup = self.backup; let restore_point = self.restore_point; let data_dir = Self::data_dir();
+        thread::spawn(move || {
+            let log = |message: String| { let _ = tx.send(Message::Log(message)); };
+            if restore_point { log("Создание точки восстановления…".to_owned()); if let Err(error) = drivers::restore_point() { log(format!("Точка восстановления не создана: {error}")); } }
+            if backup { log("Создание резервной копии драйверов…".to_owned()); match drivers::backup_all(&data_dir) { Ok(path) => log(format!("Резервная копия: {path}")), Err(error) => log(format!("Резервная копия не создана: {error}")) } }
+            let mut progress = |message: String| log(message);
+            match wua::install(&ids, &mut progress) { Ok(reboot) => { let _ = tx.send(Message::Finished { reboot }); }, Err(error) => { let _ = tx.send(Message::Failed(format!("Установка: {error}"))); } }
+        });
+    }
+
+    fn install_folder(&mut self) {
+        let folder = self.inf_folder.trim().to_owned(); if folder.is_empty() { return; }
+        self.state = State::Installing; let tx = self.tx.clone();
+        thread::spawn(move || { match drivers::install_inf_folder(&folder) { Ok(output) => { let _ = tx.send(Message::Log(output)); let _ = tx.send(Message::Finished { reboot: false }); }, Err(error) => { let _ = tx.send(Message::Failed(format!("Установка INF: {error}"))); } } });
+    }
+
+    fn poll(&mut self) {
+        while let Ok(message) = self.rx.try_recv() { match message {
+            Message::Scan { drivers, installed } => { self.installed_count = installed; self.logs.push(format!("Найдено обновлений: {}", drivers.len())); self.candidates = drivers; self.state = State::Ready; }
+            Message::Log(message) => self.logs.push(message),
+            Message::Finished { reboot } => { self.reboot = reboot; self.state = State::Done; self.logs.push("Операция завершена.".to_owned()); }
+            Message::Failed(error) => { self.logs.push(format!("Ошибка: {error}")); self.state = State::Ready; }
+        }}
     }
 }
-fn main() {
-    let data_dir = data_dir(); if let Err(error) = std::fs::create_dir_all(data_dir.join("runtime")) { eprintln!("Нельзя создать папку данных: {error}"); return; }
-    let stdin = io::stdin(); let mut stdout = io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let response = match line {
-            Ok(line) if line.len() <= MAX_LINE => match serde_json::from_str::<Request>(&line) {
-                Ok(request) if request.jsonrpc == "2.0" => match handle(&request.method, &request.params, &data_dir) { Ok(result) => Response { jsonrpc: "2.0", id: request.id, result: Some(result), error: None }, Err(message) => Response { jsonrpc: "2.0", id: request.id, result: None, error: Some(RpcError { code: -32000, message }) } },
-                Ok(request) => Response { jsonrpc: "2.0", id: request.id, result: None, error: Some(RpcError { code: -32600, message: "Неверная версия JSON-RPC.".to_owned() }) },
-                Err(error) => Response { jsonrpc: "2.0", id: String::new(), result: None, error: Some(RpcError { code: -32700, message: error.to_string() }) },
-            },
-            Ok(_) => Response { jsonrpc: "2.0", id: String::new(), result: None, error: Some(RpcError { code: -32600, message: "Слишком длинный запрос.".to_owned() }) },
-            Err(_) => break,
-        };
-        if let Ok(json) = serde_json::to_string(&response) { let _ = writeln!(stdout, "{json}"); let _ = stdout.flush(); }
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.poll();
+        let busy = matches!(self.state, State::Scanning | State::Installing);
+        if busy { ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| { ui.vertical(|ui| {
+                ui.label(RichText::new("Драйверы").size(28.0).strong());
+                let status = match self.state { State::Idle => "Проверьте обновления драйверов через Windows Update.", State::Scanning => "Windows Update ищет доступные драйверы…", State::Ready if self.candidates.is_empty() => "Подходящих обновлений не найдено.", State::Ready => "Выберите обновления для установки.", State::Installing => "Скачивание и установка драйверов…", State::Done if self.reboot => "Готово. Требуется перезагрузка Windows.", State::Done => "Готово." };
+                ui.label(RichText::new(status).color(MUTED));
+            }); ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { if ui.add_enabled(!busy, egui::Button::new("Проверить обновления").fill(ACCENT).min_size(Vec2::new(180.0, 36.0))).clicked() { self.scan(); } }); });
+            ui.add_space(18.0); ui.separator(); ui.add_space(8.0);
+            ui.horizontal(|ui| { ui.checkbox(&mut self.restore_point, "Создать точку восстановления"); ui.checkbox(&mut self.backup, "Сохранить резервную копию"); if ui.button("Выбрать все").clicked() { self.candidates.iter_mut().for_each(|driver| driver.selected = true); } if ui.button("Снять выбор").clicked() { self.candidates.iter_mut().for_each(|driver| driver.selected = false); } });
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical().max_height(290.0).show(ui, |ui| {
+                if self.candidates.is_empty() { ui.vertical_centered(|ui| { ui.add_space(64.0); ui.label(RichText::new("После проверки здесь появятся обновления драйверов.").color(MUTED)); }); }
+                for driver in &mut self.candidates { ui.group(|ui| { ui.set_min_width(ui.available_width()); ui.horizontal(|ui| { ui.checkbox(&mut driver.selected, ""); ui.vertical(|ui| { ui.label(RichText::new(&driver.title).strong()); ui.label(RichText::new([driver.class.as_str(), driver.vendor.as_str(), driver.date.as_str()].into_iter().filter(|text| !text.is_empty()).collect::<Vec<_>>().join(" · ")).color(MUTED)); }); }); }); ui.add_space(4.0); }
+            });
+            ui.separator(); ui.add_space(8.0);
+            ui.horizontal(|ui| { ui.label("Папка с INF:"); ui.add_sized([270.0, 26.0], egui::TextEdit::singleline(&mut self.inf_folder).hint_text("C:\\Drivers")); if ui.add_enabled(!busy && !self.inf_folder.trim().is_empty(), egui::Button::new("Установить из папки")).clicked() { self.install_folder(); } });
+            ui.add_space(8.0); let selected = self.candidates.iter().filter(|driver| driver.selected).count(); ui.horizontal(|ui| { ui.label(RichText::new(format!("Установлено драйверов: {}", self.installed_count)).color(MUTED)); ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { if ui.add_enabled(!busy && selected > 0, egui::Button::new(format!("Установить выбранное ({selected})")).fill(ACCENT).min_size(Vec2::new(210.0, 36.0))).clicked() { self.install(); } }); });
+            ui.add_space(8.0); egui::CollapsingHeader::new("Журнал операции").show(ui, |ui| { egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| { for line in &self.logs { ui.label(RichText::new(line).monospace()); } }); });
+        });
     }
+}
+
+fn icon() -> Arc<egui::IconData> {
+    let size = 32; let mut rgba = vec![0u8; size * size * 4];
+    for y in 0..size { for x in 0..size { let pixel = (y * size + x) * 4; let inside = x > 6 && x < 26 && y > 5 && y < 27; let color = if inside { [54, 118, 232, 255] } else { [242, 246, 252, 255] }; rgba[pixel..pixel + 4].copy_from_slice(&color); } }
+    Arc::new(egui::IconData { rgba, width: size as u32, height: size as u32 })
+}
+
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_title("ThodDriver").with_inner_size([900.0, 640.0]).with_min_inner_size([720.0, 520.0]).with_icon(icon()), ..Default::default() };
+    eframe::run_native("ThodDriver", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
